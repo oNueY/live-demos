@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#f7f0e3">
+<title>Fragen · 質問</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Klee+One:wght@600&family=Zen+Maru+Gothic:wght@500;700&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ccircle cx=%2250%22 cy=%2250%22 r=%2242%22 fill=%22%23e07a3f%22/%3E%3Ctext x=%2250%22 y=%2266%22 font-size=%2248%22 text-anchor=%22middle%22 fill=%22white%22%3E%3F%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.16.1/dist/mqtt.min.js"></script>
+<script src="app.js"></script>
+</head>
+<body>
+<main class="phone">
+  <div class="top">
+    <span class="status" id="status" data-t="connecting"></span>
+    <span class="lang"><button data-lang="de">DE</button><button data-lang="ja">日本語</button></span>
+  </div>
+  <h1 id="title"></h1>
+
+  <section class="askbox" id="askbox">
+    <textarea id="q" maxlength="280" data-tph="ask_ph"></textarea>
+    <div class="row">
+      <span class="note" data-t="anon"></span>
+      <span class="count" id="count">0/280</span>
+    </div>
+    <button class="btn primary" id="send" data-t="send"></button>
+    <div class="toast" id="toast"></div>
+  </section>
+
+  <section>
+    <h2 data-t="list_head"></h2>
+    <p class="hint" data-t="list_hint"></p>
+  </section>
+  <ol class="plist" id="list"></ol>
+  <p class="hint" id="empty" data-t="empty"></p>
+
+  <footer class="made" id="made"></footer>
+</main>
+
+<div class="phonefill" id="fill"><div class="msg" data-t="hold_up"></div></div>
+
+<script>
+(() => {
+  LW.wash();
+  LW.madeBy(document.getElementById('made'));
+  const $ = (id) => document.getElementById(id);
+  const room = LW.params.get('room');
+  const me = LW.cid();
+  let state = null;
+
+  LW.langSwitch(() => { render(); setStatus(lastStatus); });
+  if (!room) { $('askbox').hidden = true; $('title').textContent = LW.t('no_room'); return; }
+
+  const VOTES = 'lw-votes-' + room;
+  const mine = new Set(JSON.parse(localStorage.getItem(VOTES) || '[]'));
+  const saveVotes = () => localStorage.setItem(VOTES, JSON.stringify([...mine]));
+
+  let lastStatus = 'wait';
+  function setStatus(s) {
+    lastStatus = s;
+    const el = $('status');
+    el.textContent = s === 'on' ? '● live' : s === 'wait' ? LW.t('connecting') : LW.t('offline');
+    el.className = 'status' + (s === 'on' ? '' : ' off');
+    $('send').disabled = s !== 'on';
+  }
+  setStatus('wait');
+
+  const up = LW.topic(room, 'up');
+  const c = LW.connect((s) => { setStatus(s); if (s === 'on') hi(); });
+  const hi = () => c.connected && LW.send(c, up, { t: 'hi', cid: me }, { qos: 0 });
+  setInterval(hi, 15000);
+  c.subscribe(LW.topic(room, 'state'), { qos: 1 });
+  c.on('message', (tp, buf) => {
+    const m = LW.parse(buf);
+    if (!m || !Array.isArray(m.qs)) return;
+    const was = state && state.mode !== 'wall' && state.color;
+    state = m;
+    if (m.mode !== 'wall' && m.color !== was && navigator.vibrate) navigator.vibrate(25);
+    render();
+  });
+
+  // ---- asking ----
+  const ta = $('q');
+  ta.addEventListener('input', () => { $('count').textContent = ta.value.length + '/280'; });
+  let cool = 0;
+  $('send').onclick = () => {
+    const text = ta.value.trim();
+    if (!text) return ta.focus();
+    if (Date.now() < cool) { toast(LW.t('too_fast')); return; }
+    cool = Date.now() + 3000;
+    LW.send(c, up, { t: 'ask', id: LW.rid(10), text, cid: me });
+    ta.value = '';
+    $('count').textContent = '0/280';
+    toast(state && state.review === false ? LW.t('thanks_live') : LW.t('thanks_review'));
+  };
+  let toastTimer;
+  function toast(s) { $('toast').textContent = s; clearTimeout(toastTimer); toastTimer = setTimeout(() => { $('toast').textContent = ''; }, 5000); }
+
+  // ---- voting ----
+  function vote(id) {
+    const on = !mine.has(id);
+    on ? mine.add(id) : mine.delete(id);
+    saveVotes();
+    LW.send(c, up, { t: 'vote', qid: id, on, cid: me });
+    // show it right away; the next state from the screen will confirm the count
+    const q = state && state.qs.find((x) => x.id === id);
+    if (q) { q.votes += on ? 1 : -1; render(); }
+  }
+
+  // ---- drawing ----
+  const order = (a, b) => (a.status === 'answered') - (b.status === 'answered') || b.votes - a.votes || a.ts - b.ts;
+  function render() {
+    if (!state) return;
+    LW.setTitle($('title'), state.title);
+    document.title = state.title;
+    document.body.classList.toggle('colormode', state.mode !== 'wall');
+    $('fill').style.backgroundColor = state.color;
+    $('fill').style.color = LW.inkFor(state.color);
+    const qs = [...state.qs].sort(order);
+    $('empty').hidden = qs.length > 0;
+    LW.keyedRender($('list'), qs,
+      () => {
+        const li = document.createElement('li');
+        li.className = 'pq';
+        li.innerHTML = '<div class="text"></div><button class="metoo"><span></span><b></b></button>';
+        li.querySelector('button').onclick = () => vote(li.dataset.id);
+        return li;
+      },
+      (li, q) => {
+        const tx = li.querySelector('.text');
+        tx.textContent = q.text;
+        if (q.status === 'answered') {
+          const tag = document.createElement('span');
+          tag.className = 'tag';
+          tag.textContent = '✓ ' + LW.t('answered');
+          tx.appendChild(tag);
+        }
+        li.classList.toggle('answered', q.status === 'answered');
+        const b = li.querySelector('.metoo');
+        b.classList.toggle('on', mine.has(q.id));
+        b.querySelector('span').textContent = '🙋 ' + LW.t('me_too');
+        b.querySelector('b').textContent = q.votes;
+      });
+  }
+
+  // keep the phone awake while the page is open (colour mode needs a lit screen)
+  async function wake() { try { await navigator.wakeLock?.request('screen'); } catch {} }
+  wake();
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { wake(); hi(); } });
+})();
+</script>
+</body>
+</html>
